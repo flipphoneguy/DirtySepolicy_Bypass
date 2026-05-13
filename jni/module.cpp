@@ -1,10 +1,12 @@
 // DirtySepolicy Bypass — Zygisk module
 //
-// PLT-hooks selinux_check_access / security_compute_av(_flags) in every
-// loaded shared object. When a probe's scon or tcon contains the name of a
-// hidden SELinux type the hook synthesises a "denied" result locally without
-// reaching the kernel's selinuxfs. Every other access check passes through
-// to the real libselinux unchanged.
+// Defeats DirtySepolicy v2.0 detection by:
+// 1. PLT-hooking selinux_check_access / security_compute_av(_flags) to hide
+//    probes whose scon/tcon contains a known framework type name.
+// 2. PLT-hooking open/write/close to intercept contextExists() checks that
+//    write directly to /sys/fs/selinux/context and /proc/self/attr/current.
+// 3. Blocking exact (scon,tcon,class,perm) tuples for indirect probes that
+//    use only stock context names but reveal framework-injected allow rules.
 
 #include <string.h>
 #include <errno.h>
@@ -12,6 +14,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -43,25 +46,14 @@ struct av_decision {
     unsigned int    flags;
 };
 
-// Substrings that, when seen in scon or tcon, cause the hook to lie.
-// Patterns are prefix-shaped so they catch every *_file, *_exec, *_data,
-// *_service, *32, etc. variant a fork might introduce.
-//
-// `:su:` is intentionally exact (trailing colon) so it only hides the AOSP
-// `u:r:su:s0` / `u:object_r:su_*:s0` family — broader matching would catch
-// stock type names ending in `_su`.
+// ---- hidden context substrings ------------------------------------------
+
 static const char *const kHidden[] = {
-    // Magisk + forks
     ":magisk",     ":kitsune",    ":apatch",
-    // KernelSU
     ":ksu",        ":kernelsu",
-    // Xposed family
     ":lsposed",    ":xposed",     ":riru",
-    // adb_root patch and adbroot_* siblings
     ":adbroot",
-    // SuperSU / supolicy / AOSP su
     ":supersu",    ":supolicy",   ":su:",
-    // Generic zygisk artifact name some forks use
     ":zygisk",
     nullptr,
 };
@@ -74,10 +66,8 @@ static inline bool is_hidden(const char *con) {
     return false;
 }
 
-// Permissions we lie about regardless of which domains the probe names.
-// These are "policy hygiene" indicators (e.g. system_server can execmem)
-// that hygiene-style detectors flag. Kernel enforcement is unchanged —
-// only userspace probers see the lie.
+// ---- hidden permissions (hygiene probes) ---------------------------------
+
 static const char *const kHiddenPerms[] = {
     "execmem",
     nullptr,
@@ -91,11 +81,45 @@ static inline bool is_hidden_perm(const char *perm) {
     return false;
 }
 
-// To also hide the same probe when made via the lower-level
-// security_compute_av(_flags) ABI (which takes numeric class/perm IDs
-// instead of strings), we resolve each (class_name, perm_name) pair to its
-// numeric (class_id, perm_bit) at hook-install time, then mask the bit out
-// of the returned allowed mask on subsequent calls.
+// ---- exact-match probes (stock contexts, framework-injected rules) ------
+
+struct ExactProbe {
+    const char *scon;
+    const char *tcon;
+    const char *tclass;
+    const char *perm;
+};
+
+static const ExactProbe kHiddenExact[] = {
+    // Magisk: tmpfs mounts on rootfs, kernel fifo access to tmpfs
+    {"u:object_r:rootfs:s0", "u:object_r:tmpfs:s0", "filesystem", "associate"},
+    {"u:r:kernel:s0",        "u:object_r:tmpfs:s0", "fifo_file",  "open"},
+    // KernelSU: kernel reads adb_data_file
+    {"u:r:kernel:s0",        "u:object_r:adb_data_file:s0", "file", "read"},
+    // LSPosed: system_server executes injected APKs
+    {"u:r:system_server:s0", "u:object_r:apk_data_file:s0", "file", "execute"},
+    // Xposed: dex2oat execute_no_trans
+    {"u:r:dex2oat:s0",       "u:object_r:dex2oat_exec:s0",  "file", "execute_no_trans"},
+    // ZygiskNext: zygote searches adb_data_file dirs
+    {"u:r:zygote:s0",        "u:object_r:adb_data_file:s0", "dir",  "search"},
+    {nullptr, nullptr, nullptr, nullptr},
+};
+
+static inline bool is_hidden_exact(const char *scon, const char *tcon,
+                                   const char *tclass, const char *perm) {
+    if (!scon || !tcon || !tclass || !perm) return false;
+    for (int i = 0; kHiddenExact[i].scon; ++i) {
+        if (strcmp(scon, kHiddenExact[i].scon) == 0 &&
+            strcmp(tcon, kHiddenExact[i].tcon) == 0 &&
+            strcmp(tclass, kHiddenExact[i].tclass) == 0 &&
+            strcmp(perm, kHiddenExact[i].perm) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---- numeric resolution for security_compute_av -------------------------
 
 struct ClassPerm { const char *cls; const char *perm; };
 static const ClassPerm kHiddenClassPerms[] = {
@@ -109,7 +133,17 @@ struct ResolvedBit {
 };
 static ResolvedBit g_hidden_bits[8] = {};
 static int         g_hidden_bit_count = 0;
-static bool        g_bits_resolved = false;
+
+struct ExactBit {
+    const char      *scon;
+    const char      *tcon;
+    security_class_t cls_id;
+    access_vector_t  perm_bit;
+};
+static ExactBit g_exact_bits[16] = {};
+static int      g_exact_bit_count = 0;
+
+static bool g_bits_resolved = false;
 
 static void resolve_hidden_bits() {
     if (g_bits_resolved) return;
@@ -127,6 +161,17 @@ static void resolve_hidden_bits() {
             if (!pbit) continue;
             g_hidden_bits[g_hidden_bit_count++] = { cid, pbit };
         }
+        for (int i = 0;
+             kHiddenExact[i].scon && g_exact_bit_count < 16;
+             ++i) {
+            security_class_t cid = str_to_cls(kHiddenExact[i].tclass);
+            if (!cid) continue;
+            access_vector_t pbit = str_to_perm(cid, kHiddenExact[i].perm);
+            if (!pbit) continue;
+            g_exact_bits[g_exact_bit_count++] = {
+                kHiddenExact[i].scon, kHiddenExact[i].tcon, cid, pbit
+            };
+        }
     }
     g_bits_resolved = true;
 }
@@ -141,6 +186,19 @@ static inline void mask_hidden_bits(security_class_t tclass, av_decision *avd) {
     }
 }
 
+static inline void mask_exact_bits(const char *scon, const char *tcon,
+                                   security_class_t tclass, av_decision *avd) {
+    if (!avd || !scon || !tcon) return;
+    for (int i = 0; i < g_exact_bit_count; ++i) {
+        if (g_exact_bits[i].cls_id == tclass &&
+            strcmp(scon, g_exact_bits[i].scon) == 0 &&
+            strcmp(tcon, g_exact_bits[i].tcon) == 0) {
+            avd->allowed    &= ~g_exact_bits[i].perm_bit;
+            avd->auditallow &= ~g_exact_bits[i].perm_bit;
+        }
+    }
+}
+
 static void fake_deny(av_decision *avd) {
     if (!avd) return;
     avd->allowed    = 0;
@@ -151,7 +209,7 @@ static void fake_deny(av_decision *avd) {
     avd->flags      = 0;
 }
 
-// ---- hook trampolines ----------------------------------------------------
+// ---- selinux hook trampolines -------------------------------------------
 
 static int (*orig_security_compute_av)(const char *, const char *,
                                        security_class_t, access_vector_t,
@@ -173,7 +231,10 @@ static int my_security_compute_av(const char *scon, const char *tcon,
     }
     if (!orig_security_compute_av) { errno = ENOSYS; return -1; }
     int r = orig_security_compute_av(scon, tcon, tclass, requested, avd);
-    if (r == 0) mask_hidden_bits(tclass, avd);
+    if (r == 0) {
+        mask_hidden_bits(tclass, avd);
+        mask_exact_bits(scon, tcon, tclass, avd);
+    }
     return r;
 }
 
@@ -187,14 +248,18 @@ static int my_security_compute_av_flags(const char *scon, const char *tcon,
     }
     if (!orig_security_compute_av_flags) { errno = ENOSYS; return -1; }
     int r = orig_security_compute_av_flags(scon, tcon, tclass, requested, avd);
-    if (r == 0) mask_hidden_bits(tclass, avd);
+    if (r == 0) {
+        mask_hidden_bits(tclass, avd);
+        mask_exact_bits(scon, tcon, tclass, avd);
+    }
     return r;
 }
 
 static int my_selinux_check_access(const char *scon, const char *tcon,
                                    const char *tclass, const char *perm,
                                    void *auditdata) {
-    if (is_hidden(scon) || is_hidden(tcon) || is_hidden_perm(perm)) {
+    if (is_hidden(scon) || is_hidden(tcon) || is_hidden_perm(perm) ||
+        is_hidden_exact(scon, tcon, tclass, perm)) {
         errno = EACCES;
         return -1;
     }
@@ -202,6 +267,83 @@ static int my_selinux_check_access(const char *scon, const char *tcon,
         return orig_selinux_check_access(scon, tcon, tclass, perm, auditdata);
     errno = ENOSYS;
     return -1;
+}
+
+// ---- context-file interception (defeats contextExists) ------------------
+//
+// DirtySepolicy v2.0 writes context strings directly to kernel-backed files
+// to check if SELinux types exist, bypassing libselinux APIs entirely.
+// We intercept these writes and return EINVAL for hidden contexts.
+
+#define MAX_CTX_FDS 4
+static int g_ctx_fds[MAX_CTX_FDS] = {-1, -1, -1, -1};
+static int g_ctx_fd_count = 0;
+
+static inline bool is_ctx_fd(int fd) {
+    for (int i = 0; i < g_ctx_fd_count; ++i)
+        if (g_ctx_fds[i] == fd) return true;
+    return false;
+}
+
+static inline void track_ctx_fd(int fd) {
+    if (g_ctx_fd_count < MAX_CTX_FDS)
+        g_ctx_fds[g_ctx_fd_count++] = fd;
+}
+
+static inline void untrack_ctx_fd(int fd) {
+    for (int i = 0; i < g_ctx_fd_count; ++i) {
+        if (g_ctx_fds[i] == fd) {
+            g_ctx_fds[i] = g_ctx_fds[--g_ctx_fd_count];
+            g_ctx_fds[g_ctx_fd_count] = -1;
+            return;
+        }
+    }
+}
+
+static inline bool is_context_path(const char *path) {
+    return path &&
+           (strcmp(path, "/sys/fs/selinux/context") == 0 ||
+            strcmp(path, "/proc/self/attr/current") == 0);
+}
+
+static int     (*orig_open)(const char *, int, ...) = nullptr;
+static int     (*orig_openat)(int, const char *, int, ...) = nullptr;
+static ssize_t (*orig_write)(int, const void *, size_t) = nullptr;
+static int     (*orig_close)(int) = nullptr;
+
+static int my_open(const char *pathname, int flags, mode_t mode) {
+    int fd = orig_open ? orig_open(pathname, flags, mode) : -1;
+    if (fd >= 0 && is_context_path(pathname))
+        track_ctx_fd(fd);
+    return fd;
+}
+
+static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
+    int fd = orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
+    if (fd >= 0 && is_context_path(pathname))
+        track_ctx_fd(fd);
+    return fd;
+}
+
+static ssize_t my_write(int fd, const void *buf, size_t count) {
+    if (g_ctx_fd_count > 0 && is_ctx_fd(fd) &&
+        buf && count > 0 && count < 256) {
+        char tmp[256];
+        memcpy(tmp, buf, count);
+        tmp[count] = '\0';
+        if (is_hidden(tmp)) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    if (!orig_write) { errno = ENOSYS; return -1; }
+    return orig_write(fd, buf, count);
+}
+
+static int my_close(int fd) {
+    if (g_ctx_fd_count > 0 && is_ctx_fd(fd))
+        untrack_ctx_fd(fd);
+    return orig_close ? orig_close(fd) : -1;
 }
 
 // ---- map walking ---------------------------------------------------------
@@ -235,6 +377,15 @@ static int register_against_all_libs(zygisk::Api *api) {
         api->pltHookRegister(st.st_dev, st.st_ino, "selinux_check_access",
                              (void *)my_selinux_check_access,
                              (void **)&orig_selinux_check_access);
+
+        api->pltHookRegister(st.st_dev, st.st_ino, "open",
+                             (void *)my_open,   (void **)&orig_open);
+        api->pltHookRegister(st.st_dev, st.st_ino, "openat",
+                             (void *)my_openat, (void **)&orig_openat);
+        api->pltHookRegister(st.st_dev, st.st_ino, "write",
+                             (void *)my_write,  (void **)&orig_write);
+        api->pltHookRegister(st.st_dev, st.st_ino, "close",
+                             (void *)my_close,  (void **)&orig_close);
         ++n;
     }
     fclose(fp);

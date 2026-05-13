@@ -1,38 +1,26 @@
 # DirtySepolicy Bypass
 
-Zygisk module that defeats [LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy) and any detector using the same App-Zygote SELinux-probe technique.
+Zygisk module that defeats [LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy) v2.0 and any detector using the same App-Zygote SELinux-probe technique.
 
 ## How it works
 
-DirtySepolicy probes the kernel's loaded SELinux policy from inside App Zygote, looking for type names injected by root/hooking frameworks (Magisk, KernelSU, LSPosed, etc.). If the probe returns "allowed", the framework is detected.
+DirtySepolicy v2.0 uses three detection methods from inside App Zygote:
 
-This module installs PLT hooks on three libselinux entry points in every loaded `.so`:
+1. **`contextExists()`** — writes context strings to `/sys/fs/selinux/context` and `/proc/self/attr/current` to check if framework-injected SELinux types exist in the loaded kernel policy. This bypasses all libselinux API hooks.
 
-- `selinux_check_access`
-- `security_compute_av`
-- `security_compute_av_flags`
+2. **`checkSELinuxAccess()`** with framework contexts — probes for allow rules whose scon/tcon contains framework type names (`:magisk`, `:ksu`, `:lsposed`, etc.).
 
-When a call's `scon` or `tcon` contains a known framework substring, the hook returns a synthetic "denied" result without forwarding to the kernel. All other access checks pass through unchanged.
+3. **`checkSELinuxAccess()`** with stock contexts — probes for allow rules between stock Android contexts that only exist because a framework injected them (e.g. `rootfs→tmpfs:associate` for Magisk, `kernel→adb_data_file:read` for KernelSU).
 
-## Repository layout
+This module defeats all three vectors:
 
-```
-DirtySepolicy_Bypass/
-├── README.md              # This file
-├── .gitignore
-├── module/                # Flashable Magisk module structure
-│   ├── module.prop        # Module metadata (id, name, version)
-│   ├── customize.sh       # Installer: validates Magisk version, Zygisk, ABI
-│   ├── META-INF/          # Standard Magisk zip boilerplate
-│   └── zygisk/            # Compiled .so goes here (not tracked — see Releases)
-├── jni/                   # Native source code
-│   ├── module.cpp         # Hook implementation (blocklist + PLT hook logic)
-│   ├── zygisk.hpp         # Zygisk API v5 header (from upstream Magisk)
-│   ├── Android.mk         # NDK build config
-│   └── Application.mk    # NDK app-level config (ABI, STL, optimization)
-└── tools/
-    └── audit.py           # Detection-surface audit script (run on-device)
-```
+| Hook | Target | Method |
+|---|---|---|
+| `open` / `openat` / `write` / `close` | Track fds to `/sys/fs/selinux/context` and `/proc/self/attr/current`; return `EINVAL` for writes containing hidden type substrings | Defeats `contextExists()` |
+| `selinux_check_access` | Substring match on scon/tcon + permission blocklist + exact-match probe table | Defeats both direct and indirect `checkSELinuxAccess()` probes |
+| `security_compute_av` / `security_compute_av_flags` | Same logic via resolved numeric class/perm IDs | Defeats native-code detectors using the lower-level API |
+
+All hooks are installed via Zygisk PLT hooking across every loaded `.so` in every app and system_server process.
 
 ## Hidden type patterns
 
@@ -49,6 +37,17 @@ DirtySepolicy_Bypass/
 | `:supersu` / `:supolicy` | SuperSU legacy types |
 | `:su:` | AOSP `u:r:su:s0` (exact — trailing colon avoids false positives) |
 | `:zygisk` | Any generic `zygisk_*` artifact |
+
+## Exact-match probe table (indirect stock-context probes)
+
+| scon | tcon | class | perm | Detects |
+|---|---|---|---|---|
+| `rootfs` | `tmpfs` | `filesystem` | `associate` | Magisk |
+| `kernel` | `tmpfs` | `fifo_file` | `open` | Magisk |
+| `kernel` | `adb_data_file` | `file` | `read` | KernelSU |
+| `system_server` | `apk_data_file` | `file` | `execute` | LSPosed |
+| `dex2oat` | `dex2oat_exec` | `file` | `execute_no_trans` | Xposed |
+| `zygote` | `adb_data_file` | `dir` | `search` | ZygiskNext |
 
 ## Build
 
@@ -107,18 +106,19 @@ su -c reboot
    su -c "python3 tools/audit.py"
    ```
 
-## Extending the blocklist
+## Extending the bypass
 
-If `audit.py` reports a `LEAK` or `EXPOSED` type:
+If `audit.py` reports a `LEAK`:
 
-1. Add the substring to `kHidden[]` in `jni/module.cpp`
-2. Add the same substring to `HOOK_BLOCKLIST` in `tools/audit.py`
-3. Rebuild, reflash, reboot, re-audit
+- **For new framework type names:** Add the substring to `kHidden[]` in `jni/module.cpp` and `HOOK_BLOCKLIST` in `tools/audit.py`.
+- **For new indirect stock-context probes:** Add the exact tuple to `kHiddenExact[]` in `jni/module.cpp` and `HOOK_EXACT_PROBES` in `tools/audit.py`.
+- Rebuild, reflash, reboot, re-audit.
 
 ## Limitations
 
 - **Substring blocklist.** New frameworks with novel type names need manual addition.
-- **Hygiene probes hidden.** `system_server execmem` (a stock-policy property, not a root indicator) is denied to userspace probers so hygiene-style detectors report a clean result. Kernel enforcement is unchanged.
+- **Exact-match table.** New indirect probes using stock contexts need manual addition.
+- **Raw policy parsing.** A detector that reads `/sys/fs/selinux/policy` as a binary blob and parses type names directly could bypass all userspace hooks. No current detector does this.
 
 ## Compatibility
 

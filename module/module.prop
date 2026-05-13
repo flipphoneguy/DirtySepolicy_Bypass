@@ -1,7 +1,7 @@
 id=dirtysepbypass
 name=DirtySepolicy Bypass
-version=v1.0.0
-versionCode=10000
+version=v2.0.0
+versionCode=20000
 author=local
-description=PLT-hooks selinux_check_access in every app/system process so probes against magisk/ksu/lsposed/xposed SELinux types return denied without reaching the kernel. Defeats LSPosed DirtySepolicy.
+description=Defeats DirtySepolicy v2.0 via PLT hooks on selinux_check_access, security_compute_av, open/write/close. Hides framework types, blocks contextExists() file-write probes, and masks indirect stock-context probes.
 updateJson=
