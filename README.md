@@ -1,24 +1,28 @@
 # DirtySepolicy Bypass
 
-Zygisk module that defeats [LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy) v2.0 and any detector using the same App-Zygote SELinux-probe technique.
+Zygisk module that defeats [LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy) v2.0–v2.2 and any detector using the same App-Zygote SELinux-probe technique.
 
 ## How it works
 
-DirtySepolicy v2.0 uses three detection methods from inside App Zygote:
+DirtySepolicy v2.2 uses four detection methods from inside App Zygote:
 
-1. **`contextExists()`** — writes context strings to `/sys/fs/selinux/context` and `/proc/self/attr/current` to check if framework-injected SELinux types exist in the loaded kernel policy. This bypasses all libselinux API hooks.
+1. **`contextExists()`** — writes context strings to `/sys/fs/selinux/context`, queries `/sys/fs/selinux/access`, and falls back to `/proc/self/attr/current` to check if framework-injected SELinux types exist in the loaded kernel policy.
 
-2. **`checkSELinuxAccess()`** with framework contexts — probes for allow rules whose scon/tcon contains framework type names (`:magisk`, `:ksu`, `:lsposed`, etc.).
+2. **`checkSELinuxAccess()`** via kernel — resolves class/perm names from `/sys/fs/selinux/class/` and queries `/sys/fs/selinux/access` directly, bypassing libselinux entirely.
 
-3. **`checkSELinuxAccess()`** with stock contexts — probes for allow rules between stock Android contexts that only exist because a framework injected them (e.g. `rootfs→tmpfs:associate` for Magisk, `kernel→adb_data_file:read` for KernelSU).
+3. **`readStatus()` / `avdSeqNo`** — reads `/sys/fs/selinux/status` for sequence/policyload counters and reads `seqno` from `/sys/fs/selinux/access` responses to detect policy reloads.
 
-This module defeats all three vectors:
+4. **Indirect stock-context probes** — checks allow rules between stock Android contexts that only exist because a framework injected them (e.g. `rootfs→tmpfs:associate` for Magisk).
+
+This module defeats all four vectors:
 
 | Hook | Target | Method |
 |---|---|---|
-| `open` / `openat` / `write` / `close` | Track fds to `/sys/fs/selinux/context` and `/proc/self/attr/current`; return `EINVAL` for writes containing hidden type substrings | Defeats `contextExists()` |
-| `selinux_check_access` | Substring match on scon/tcon + permission blocklist + exact-match probe table | Defeats both direct and indirect `checkSELinuxAccess()` probes |
-| `security_compute_av` / `security_compute_av_flags` | Same logic via resolved numeric class/perm IDs | Defeats native-code detectors using the lower-level API |
+| `write` on `/sys/fs/selinux/access` | Block writes containing hidden context substrings; stash query for read patching | Defeats `contextExists()` access fallback and hidden-context `checkSELinuxAccess()` |
+| `read` on `/sys/fs/selinux/access` | Parse kernel response, mask hidden permission bits, mask exact-probe bits, rewrite `seqno` to 1 | Defeats `checkSELinuxAccess()` and `avdSeqNo` detection |
+| `read` on `/sys/fs/selinux/status` | Patch `sequence` and `policyload` fields to clean-boot values based on kernel version | Defeats `readStatus()` policy-reload detection |
+| `write` on `/sys/fs/selinux/context` and `/proc/self/attr/current` | Return `EINVAL` for writes containing hidden type substrings | Defeats `contextExists()` first and last checks |
+| `selinux_check_access` / `security_compute_av` | Same logic via libselinux API (defense-in-depth for older detectors) | Defeats v2.0/v2.1 and any libselinux-based detector |
 
 All hooks are installed via Zygisk PLT hooking across every loaded `.so` in every app and system_server process.
 
@@ -119,6 +123,7 @@ If `audit.py` reports a `LEAK`:
 - **Substring blocklist.** New frameworks with novel type names need manual addition.
 - **Exact-match table.** New indirect probes using stock contexts need manual addition.
 - **Raw policy parsing.** A detector that reads `/sys/fs/selinux/policy` as a binary blob and parses type names directly could bypass all userspace hooks. No current detector does this.
+- **Kernel-level counters.** The status and seqno patches assume specific clean-boot values (kernel < 6.10: seq=0/policyload=0; kernel >= 6.10: seq=4/policyload=1). Non-standard boot sequences or OEM policy loaders could produce different baselines.
 
 ## Compatibility
 
