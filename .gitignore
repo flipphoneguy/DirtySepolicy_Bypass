@@ -1,3 +1,4 @@
 dirtysepbypass.zip
 *.so
 tmp/
+__pycache__/
