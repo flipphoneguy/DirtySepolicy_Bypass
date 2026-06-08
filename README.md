@@ -1,5 +1,11 @@
 # DirtySepolicy Bypass
 
+<div align="center">
+
+![Downloads](https://img.shields.io/github/downloads/flipphoneguy/DirtySepolicy_Bypass/total)
+
+</div>
+
 Zygisk module that defeats all versions of [LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy) up to v2.2, and any detector using the same App-Zygote SELinux-probe technique.
 
 ## How it works
